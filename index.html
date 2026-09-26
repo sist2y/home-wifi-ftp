@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>家用檔案分享</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0 auto;
+    max-width: 42rem;
+    padding: 1.25rem;
+    font: 16px/1.4 ui-sans-serif, system-ui, sans-serif;
+    color: #1a1a1a;
+    background: #f4f1ea;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .75rem; }
+  .meta { display: grid; gap: .4rem; margin-bottom: 1rem; }
+  .row { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
+  label.k { width: 4.5rem; color: #555; flex: none; }
+  input[readonly] {
+    flex: 1;
+    min-width: 12rem;
+    padding: .35rem .5rem;
+    border: 1px solid #c9c3b6;
+    background: #fff;
+    font: inherit;
+  }
+  button, .btn {
+    font: inherit;
+    border: 1px solid #1a1a1a;
+    background: #1a1a1a;
+    color: #fff;
+    padding: .35rem .7rem;
+    cursor: pointer;
+  }
+  button.ghost { background: #fff; color: #1a1a1a; }
+  .hint { color: #666; font-size: .85rem; }
+  .bar { display: flex; gap: .5rem; align-items: center; margin: 1rem 0 .5rem; flex-wrap: wrap; }
+  .path { flex: 1; word-break: break-all; }
+  ul { list-style: none; margin: 0; padding: 0; border: 1px solid #c9c3b6; background: #fff; }
+  li { display: flex; border-top: 1px solid #eee; }
+  li:first-child { border-top: 0; }
+  li button {
+    flex: 1;
+    text-align: left;
+    background: transparent;
+    color: inherit;
+    border: 0;
+    padding: .6rem .7rem;
+  }
+  li button:hover { background: #f7f4ee; }
+  .sz { color: #666; font-variant-numeric: tabular-nums; padding: .6rem .7rem; }
+  .empty { padding: 1.2rem; color: #666; }
+</style>
+<body>
+  <h1>家用檔案分享</h1>
+  <div class="meta">
+    <div class="row"><span class="k">Wi-Fi</span><strong id="ssid">…</strong></div>
+    <div class="row">
+      <span class="k">網址</span>
+      <input id="url" readonly />
+      <button type="button" id="copy">複製</button>
+    </div>
+    <div class="row"><span class="k">資料夾</span><span id="folder" class="hint"></span></div>
+    <p class="hint">第二部機要同一 Wi-Fi，瀏覽器開呢個網址。連唔到先考慮防火牆，唔一定要跑 netsh。</p>
+  </div>
+  <div class="bar">
+    <button type="button" class="ghost" id="updir">上層</button>
+    <span class="path" id="curpath">/</span>
+    <label class="btn">上載<input id="file" type="file" multiple hidden /></label>
+  </div>
+  <ul id="list"></ul>
+<script>
+  let cur = ''
+  const $ = (id) => document.getElementById(id)
+
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B'
+    if (n < 1048576) return (n / 1024).toFixed(1) + ' KB'
+    if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB'
+    return (n / 1073741824).toFixed(1) + ' GB'
+  }
+
+  function joinPath(base, name) {
+    return base ? base + '/' + name : name
+  }
+
+  async function status() {
+    const s = await fetch('/api/status').then((r) => r.json())
+    $('ssid').textContent = s.ssid
+    $('url').value = 'http://' + s.ip + ':' + s.port
+    $('folder').textContent = s.folder
+  }
+
+  async function load() {
+    $('curpath').textContent = '/' + cur
+    const q = new URLSearchParams({ path: cur })
+    const r = await fetch('/api/list?' + q)
+    const data = await r.json()
+    const ul = $('list')
+    ul.replaceChildren()
+    if (!r.ok) {
+      ul.append(Object.assign(document.createElement('li'), { textContent: data.error || '讀取失敗', className: 'empty' }))
+      return
+    }
+    if (!data.items.length) {
+      const li = document.createElement('li')
+      li.className = 'empty'
+      li.textContent = '空資料夾'
+      ul.append(li)
+      return
+    }
+    for (const it of data.items) {
+      const li = document.createElement('li')
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.textContent = it.name + (it.dir ? '/' : '')
+      btn.onclick = () => {
+        if (it.dir) {
+          cur = joinPath(cur, it.name)
+          load()
+        } else {
+          location.href = '/dl?' + new URLSearchParams({ path: joinPath(cur, it.name) })
+        }
+      }
+      li.append(btn)
+      if (!it.dir) {
+        const sz = document.createElement('span')
+        sz.className = 'sz'
+        sz.textContent = fmtSize(it.size)
+        li.append(sz)
+      }
+      ul.append(li)
+    }
+  }
+
+  $('updir').onclick = () => {
+    if (!cur) return
+    const i = cur.lastIndexOf('/')
+    cur = i === -1 ? '' : cur.slice(0, i)
+    load()
+  }
+
+  $('copy').onclick = async () => {
+    const v = $('url').value
+    try {
+      await navigator.clipboard.writeText(v)
+    } catch {
+      $('url').select()
+      document.execCommand('copy')
+    }
+  }
+
+  $('file').onchange = async (e) => {
+    const files = [...e.target.files]
+    e.target.value = ''
+    for (const f of files) {
+      const q = new URLSearchParams({ path: cur, name: f.name })
+      const r = await fetch('/up?' + q, { method: 'POST', body: f })
+      if (!r.ok) {
+        alert('上載失敗：' + f.name)
+        break
+      }
+    }
+    load()
+  }
+
+  status()
+  load()
+</script>
