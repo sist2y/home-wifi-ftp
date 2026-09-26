@@ -34,6 +34,7 @@
     cursor: pointer;
   }
   button.ghost { background: #fff; color: #1a1a1a; }
+  button.ico { padding: .35rem; line-height: 0; }
   .hint { color: #666; font-size: .85rem; }
   .bar { display: flex; gap: .5rem; align-items: center; margin: 1rem 0 .5rem; flex-wrap: wrap; }
   .path { flex: 1; word-break: break-all; }
@@ -50,6 +51,7 @@
   }
   li button:hover { background: #f7f4ee; }
   .sz { color: #666; font-variant-numeric: tabular-nums; padding: .6rem .7rem; }
+  a.sz { color: #1a1a1a; text-decoration: none; line-height: 0; display: flex; align-items: center; }
   .empty { padding: 1.2rem; color: #666; }
 </style>
 <body>
@@ -67,6 +69,7 @@
   <div class="bar">
     <button type="button" class="ghost" id="updir">上層</button>
     <span class="path" id="curpath">/</span>
+    <button type="button" class="ghost ico" id="dldir" aria-label="下載"><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg></button>
     <label class="btn">上載<input id="file" type="file" multiple hidden /></label>
   </div>
   <ul id="list"></ul>
@@ -124,7 +127,14 @@
         }
       }
       li.append(btn)
-      if (!it.dir) {
+      if (it.dir) {
+        const a = document.createElement('a')
+        a.className = 'sz'
+        a.setAttribute('aria-label', '下載')
+        a.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>'
+        a.href = '/dl?' + new URLSearchParams({ path: joinPath(cur, it.name) })
+        li.append(a)
+      } else {
         const sz = document.createElement('span')
         sz.className = 'sz'
         sz.textContent = fmtSize(it.size)
@@ -132,6 +142,10 @@
       }
       ul.append(li)
     }
+  }
+
+  $('dldir').onclick = () => {
+    location.href = '/dl?' + new URLSearchParams({ path: cur })
   }
 
   $('updir').onclick = () => {
