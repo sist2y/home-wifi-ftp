@@ -293,8 +293,21 @@ function makeServer(root) {
           sendJson(res, 400, { error: 'name' })
           return
         }
-        const dest = resolveUnder(root, path.posix.join(u.searchParams.get('path') || '', name))
-        const ws = fs.createWriteStream(dest)
+        const relativeDir = u.searchParams.get('path') || ''
+        const { name: stem, ext } = path.parse(name)
+        let suffix = 0
+        let ws
+        while (!ws) {
+          const fileName = suffix ? `${stem} (${suffix})${ext}` : name
+          const dest = resolveUnder(root, path.posix.join(relativeDir, fileName))
+          try {
+            const fd = fs.openSync(dest, 'wx')
+            ws = fs.createWriteStream(dest, { fd })
+          } catch (err) {
+            if (err.code !== 'EEXIST') throw err
+            suffix++
+          }
+        }
         req.pipe(ws)
         ws.on('finish', () => sendJson(res, 200, { ok: true }))
         ws.on('error', () => sendJson(res, 500, { error: 'write' }))

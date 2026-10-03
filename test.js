@@ -111,6 +111,17 @@ async function main() {
     assert.equal(upload.status, 200)
     assert.deepEqual(JSON.parse(upload.body.toString()), { ok: true })
     assert.deepEqual(fs.readFileSync(path.join(testDir, 'sub', 'uploaded.bin')), uploadFile)
+
+    const duplicateUpload = Buffer.from('second upload')
+    const duplicate = await request(port, 'POST', `/up?path=${relativeTestDir}/sub&name=uploaded.bin`, duplicateUpload)
+    assert.equal(duplicate.status, 200)
+    assert.deepEqual(fs.readFileSync(path.join(testDir, 'sub', 'uploaded.bin')), uploadFile)
+    assert.deepEqual(fs.readFileSync(path.join(testDir, 'sub', 'uploaded (1).bin')), duplicateUpload)
+
+    const thirdUpload = Buffer.from('third upload')
+    const thirdDuplicate = await request(port, 'POST', `/up?path=${relativeTestDir}/sub&name=uploaded.bin`, thirdUpload)
+    assert.equal(thirdDuplicate.status, 200)
+    assert.deepEqual(fs.readFileSync(path.join(testDir, 'sub', 'uploaded (2).bin')), thirdUpload)
     console.log('[test] file upload passed')
 
     const escapedDownload = await request(port, 'GET', `/dl?path=${relativeTestDir}/escape/secret.txt`)
