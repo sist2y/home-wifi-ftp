@@ -7,13 +7,24 @@ const { exec, execSync } = require('child_process')
 const PORT = 8787
 
 function resolveUnder(root, rel) {
-  const rootR = path.resolve(root)
+  const rootR = fs.realpathSync(path.resolve(root))
   const raw = String(rel || '').replace(/\\/g, '/')
   if (raw.includes('\0') || path.isAbsolute(raw)) throw new Error('path')
   const parts = raw.split('/').filter((p) => p && p !== '.')
   if (parts.some((p) => p === '..')) throw new Error('path')
   const out = path.resolve(rootR, ...parts)
   if (out !== rootR && !out.startsWith(rootR + path.sep)) throw new Error('path')
+  let current = rootR
+  for (const part of parts) {
+    current = path.join(current, part)
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) throw new Error('path')
+    } catch (err) {
+      if (err.message === 'path') throw err
+      if (err.code === 'ENOENT') break
+      throw err
+    }
+  }
   return out
 }
 
