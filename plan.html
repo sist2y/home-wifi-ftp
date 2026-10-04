@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Folder zip 修補計劃</title>
+<style>
+  :root { color-scheme: light; }
+  body {
+    margin: 0 auto;
+    max-width: 42rem;
+    padding: 1.25rem;
+    font: 16px/1.45 ui-sans-serif, system-ui, sans-serif;
+    color: #1a1a1a;
+    background: #f4f1ea;
+  }
+  h1 { font-size: 1.15rem; margin: 0 0 .5rem; }
+  h2 { font-size: 1rem; margin: 1.4rem 0 .5rem; }
+  p, li { margin: .4rem 0; }
+  .hint { color: #666; font-size: .85rem; }
+  ol { padding-left: 1.3rem; }
+  code {
+    font: 90%/1.4 ui-monospace, monospace;
+    background: #fff;
+    padding: .05rem .3rem;
+    border: 1px solid #c9c3b6;
+  }
+  section {
+    border: 1px solid #c9c3b6;
+    background: #fff;
+    padding: .7rem .9rem;
+    margin: .6rem 0;
+  }
+  section h2 { margin: 0 0 .35rem; }
+  .skip { color: #666; }
+</style>
+<body>
+  <h1>Folder zip 修補計劃</h1>
+  <p class="hint">zip 解得開。以下按傷害排，一次改 <code>server.js</code>／<code>index.html</code>／<code>test.js</code>。唔開新檔，唔加依賴。</p>
+
+  <h2>做</h2>
+
+  <section>
+    <h2>1. CRC 改用 zlib</h2>
+    <p>而家 <code>crc32</code> 係 JS 逐 byte 計。資料夾有片，CPU 會 Sem 住。</p>
+    <p>刪 <code>CRC_TABLE</code> 同手寫 <code>crc32</code>。頂部 <code>const { crc32 } = require('zlib')</code>。API 一樣，逐 chunk 傳上一輪嘅值。</p>
+    <p class="hint">Node 20.15+ 先有。家用機應該得。舊過呢個先至要加返 JS fallback。</p>
+  </section>
+
+  <section>
+    <h2>2. Skip symlink／junction</h2>
+    <p><code>collectZip</code> 用 <code>isDirectory()</code>。Windows junction 當目錄，指去上一層就無限遞迴，download 斷。亦可以 pack 到 share root 外面。</p>
+    <p><code>e.isSymbolicLink()</code> 就 <code>continue</code>。檔同資料夾捷徑一齊唔跟。</p>
+    <p class="hint"><code>/up</code> 造唔到 junction，要 host 自己放先中。一行就堵。</p>
+  </section>
+
+  <section>
+    <h2>3. 取消下載要停 stream</h2>
+    <p>對方撳取消，<code>drain</code> listener 同 <code>createReadStream</code> 未必清，promise 可以掛住。</p>
+    <p>每個檔：<code>res.on('close', () => rs.destroy())</code>。destroy 之後 <code>error</code>／<code>end</code> 會走現有 cleanup。</p>
+  </section>
+
+  <section>
+    <h2>4. DOS time clamp</h2>
+    <p>mtime 早過 1980，<code>writeUInt16LE</code> throw，zip 打到一半爛。</p>
+    <p><code>dosTime</code> 把年限制喺 1980–2107。一行數學，唔使分支表。</p>
+  </section>
+
+  <section>
+    <h2>5. zip 失敗要出聲</h2>
+    <p><code>zipDir(...).catch</code> 而家只 <code>destroy()</code>。加 <code>console.error</code>，唔好吞。</p>
+  </section>
+
+  <section>
+    <h2>6. 測多兩樣</h2>
+    <p>而家只 check PK magic 同檔名。加：nested 解壓後內容；symlink 唔入 zip。繼續無 framework，callback 接喺 <code>test.js</code>。</p>
+  </section>
+
+  <section>
+    <h2>7. SVG 只留一份</h2>
+    <p><code>index.html</code> 個 icon 複製咗兩次。抽 <code>const DL_SVG = '…'</code>，bar 同列表共用。</p>
+  </section>
+
+  <h2 class="skip">唔做</h2>
+  <p class="skip">zip64、壓縮、進度條、content-length。檔大過 4GB 或者一個資料夾超過 65535 個 entry 先至要。家用未到。</p>
+
+  <h2>順序</h2>
+  <ol>
+    <li>zlib CRC（刪碼，順便快）</li>
+    <li>skip symlink（安全同遞迴一齊解）</li>
+    <li>close 停 stream</li>
+    <li>dosTime clamp</li>
+    <li>console.error</li>
+    <li>test</li>
+    <li>SVG const</li>
+  </ol>
+  <p class="hint">1–5 都喺 <code>server.js</code>，一次改完跑 <code>node test.js</code>。6、7 跟住。</p>
+</body>
