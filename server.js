@@ -5,6 +5,22 @@ const path = require('path')
 const { exec, execSync } = require('child_process')
 
 const PORT = 8787
+const MIME = {
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.png': 'image/png',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.avif': 'image/avif',
+  '.mp4': 'video/mp4',
+  '.webm': 'video/webm',
+  '.mov': 'video/quicktime',
+  '.m4v': 'video/x-m4v',
+  '.mkv': 'video/x-matroska',
+}
+const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.avif'])
+const THUMB_MAX = 256 * 1024
 
 function resolveUnder(root, rel) {
   const rootR = fs.realpathSync(path.resolve(root))
@@ -223,6 +239,146 @@ async function zipDir(dir, res) {
   res.end(eocd)
 }
 
+function u16(buf, o, le) {
+  return le ? buf.readUInt16LE(o) : buf.readUInt16BE(o)
+}
+
+function u32(buf, o, le) {
+  return le ? buf.readUInt32LE(o) : buf.readUInt32BE(o)
+}
+
+function exifThumbFromIfd(seg, tiff, ifd, le) {
+  if (ifd < 0 || ifd + 2 > seg.length) return null
+  const n = u16(seg, ifd, le)
+  if (ifd + 2 + n * 12 + 4 > seg.length) return null
+  let off = 0
+  let len = 0
+  for (let i = 0; i < n; i++) {
+    const e = ifd + 2 + i * 12
+    const tag = u16(seg, e, le)
+    if (tag === 0x0201) off = u32(seg, e + 8, le)
+    else if (tag === 0x0202) len = u32(seg, e + 8, le)
+  }
+  if (!off || !len) return null
+  const start = tiff + off
+  if (start < 0 || start + len > seg.length) return null
+  const thumb = seg.subarray(start, start + len)
+  if (thumb.length < 2 || thumb[0] !== 0xff || thumb[1] !== 0xd8) return null
+  return Buffer.from(thumb)
+}
+
+function parseExifThumb(seg) {
+  if (seg.length < 16 || seg.toString('latin1', 0, 4) !== 'Exif') return null
+  const tiff = 6
+  const le = seg[tiff] === 0x49
+  if (!le && seg[tiff] !== 0x4d) return null
+  const ifd0 = tiff + u32(seg, tiff + 4, le)
+  const from0 = exifThumbFromIfd(seg, tiff, ifd0, le)
+  if (from0) return from0
+  if (ifd0 + 2 > seg.length) return null
+  const n0 = u16(seg, ifd0, le)
+  const nextPtr = ifd0 + 2 + n0 * 12
+  if (nextPtr + 4 > seg.length) return null
+  const ifd1off = u32(seg, nextPtr, le)
+  return ifd1off ? exifThumbFromIfd(seg, tiff, tiff + ifd1off, le) : null
+}
+
+function parseMpfEntry(seg) {
+  if (seg.length < 16 || seg.toString('latin1', 0, 4) !== 'MPF\0') return null
+  const tiff = 4
+  const le = seg[tiff] === 0x49
+  if (!le && seg[tiff] !== 0x4d) return null
+  const ifd = tiff + u32(seg, tiff + 4, le)
+  if (ifd + 2 > seg.length) return null
+  const n = u16(seg, ifd, le)
+  if (ifd + 2 + n * 12 + 4 > seg.length) return null
+  let num = 0
+  let ents = 0
+  for (let i = 0; i < n; i++) {
+    const e = ifd + 2 + i * 12
+    const tag = u16(seg, e, le)
+    if (tag === 0xb001) num = u32(seg, e + 8, le)
+    if (tag === 0xb002) ents = tiff + u32(seg, e + 8, le)
+  }
+  if (num < 2 || ents + num * 16 > seg.length) return null
+  let best = null
+  for (let i = 0; i < num; i++) {
+    const e = ents + i * 16
+    const size = u32(seg, e + 4, le)
+    const off = u32(seg, e + 8, le)
+    if (!off || !size) continue
+    if (!best || size < best.size) best = { off, size }
+  }
+  return best
+}
+
+function imageThumb(file) {
+  const fd = fs.openSync(file, 'r')
+  try {
+    const size = fs.fstatSync(fd).size
+    if (size < 4) return null
+    const head = Buffer.alloc(Math.min(256 * 1024, size))
+    const n = fs.readSync(fd, head, 0, head.length, 0)
+    if (head[0] !== 0xff || head[1] !== 0xd8) return null
+    let mpf = null
+    let i = 2
+    while (i + 4 <= n) {
+      if (head[i] !== 0xff) break
+      const marker = head[i + 1]
+      if (marker === 0xda || marker === 0xd9) break
+      const len = head.readUInt16BE(i + 2)
+      if (len < 2 || i + 2 + len > n) break
+      const seg = head.subarray(i + 4, i + 2 + len)
+      if (marker === 0xe1) {
+        const thumb = parseExifThumb(seg)
+        if (thumb) return thumb
+      } else if (marker === 0xe2 && !mpf) {
+        mpf = parseMpfEntry(seg)
+        if (mpf) mpf.off += i + 8
+      }
+      i += 2 + len
+    }
+    if (mpf && mpf.size <= 2 * 1024 * 1024 && mpf.off + mpf.size <= size) {
+      const buf = Buffer.alloc(mpf.size)
+      fs.readSync(fd, buf, 0, mpf.size, mpf.off)
+      if (buf[0] === 0xff && buf[1] === 0xd8) return buf
+    }
+    return null
+  } catch {
+    return null
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+function pipeFile(req, res, file, type) {
+  const size = fs.statSync(file).size
+  const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '')
+  if (m) {
+    const start = +m[1]
+    const end = m[2] ? Math.min(+m[2], size - 1) : size - 1
+    if (start >= size || start > end) {
+      res.writeHead(416, { 'content-range': `bytes */${size}` })
+      res.end()
+      return
+    }
+    res.writeHead(206, {
+      'content-type': type,
+      'content-length': end - start + 1,
+      'content-range': `bytes ${start}-${end}/${size}`,
+      'accept-ranges': 'bytes',
+    })
+    fs.createReadStream(file, { start, end }).pipe(res)
+    return
+  }
+  res.writeHead(200, {
+    'content-type': type,
+    'content-length': size,
+    'accept-ranges': 'bytes',
+  })
+  fs.createReadStream(file).pipe(res)
+}
+
 function listDir(root, rel) {
   const dir = resolveUnder(root, rel)
   if (!fs.statSync(dir).isDirectory()) throw new Error('not dir')
@@ -262,6 +418,45 @@ function makeServer(root) {
       }
       if (req.method === 'GET' && u.pathname === '/api/list') {
         sendJson(res, 200, { path: u.searchParams.get('path') || '', items: listDir(root, u.searchParams.get('path')) })
+        return
+      }
+      if (req.method === 'GET' && u.pathname === '/view') {
+        const p = resolveUnder(root, u.searchParams.get('path'))
+        const st = fs.statSync(p)
+        if (!st.isFile()) throw new Error('path')
+        pipeFile(req, res, p, MIME[path.extname(p).toLowerCase()] || 'application/octet-stream')
+        return
+      }
+      // ponytail: EXIF/MPF embedded thumbs only. sharp if PNG/HEIC need decode.
+      if (req.method === 'GET' && u.pathname === '/thumb') {
+        const p = resolveUnder(root, u.searchParams.get('path'))
+        const st = fs.statSync(p)
+        if (!st.isFile()) throw new Error('path')
+        const ext = path.extname(p).toLowerCase()
+        if (!IMAGE_EXT.has(ext)) {
+          send(res, 404, '')
+          return
+        }
+        if (ext === '.jpg' || ext === '.jpeg') {
+          const thumb = imageThumb(p)
+          if (thumb) {
+            send(res, 200, thumb, {
+              'content-type': 'image/jpeg',
+              'cache-control': 'private, max-age=86400',
+            })
+            return
+          }
+        }
+        if (st.size <= THUMB_MAX) {
+          res.writeHead(200, {
+            'content-type': MIME[ext],
+            'content-length': st.size,
+            'cache-control': 'private, max-age=86400',
+          })
+          fs.createReadStream(p).pipe(res)
+          return
+        }
+        send(res, 404, '')
         return
       }
       if (req.method === 'GET' && u.pathname === '/dl') {

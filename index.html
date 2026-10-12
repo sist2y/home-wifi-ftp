@@ -63,6 +63,9 @@
       padding: 0.35rem;
       line-height: 0;
     }
+    button.ico svg[hidden] {
+      display: none;
+    }
     .hint {
       color: #666;
       font-size: 0.85rem;
@@ -142,6 +145,82 @@
       padding: 1.2rem;
       color: #666;
     }
+    #list.grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(6.5rem, 1fr));
+      gap: 0.45rem;
+      border: 0;
+      background: transparent;
+    }
+    #list.grid li {
+      flex-direction: column;
+      border: 1px solid #c9c3b6;
+      background: #fff;
+    }
+    #list.grid li.empty {
+      grid-column: 1 / -1;
+    }
+    #list.grid li button {
+      display: flex;
+      flex-direction: column;
+      padding: 0;
+      white-space: normal;
+    }
+    #list.grid .thumb,
+    #list.grid .ph {
+      width: 100%;
+      aspect-ratio: 1;
+      object-fit: cover;
+      background: #ece8df;
+      display: block;
+    }
+    #list.grid .ph {
+      display: grid;
+      place-items: center;
+    }
+    #list.grid .ph.video {
+      background: #333;
+    }
+    #list.grid .ph.video::after {
+      content: "";
+      width: 0;
+      height: 0;
+      border: 8px solid transparent;
+      border-left: 14px solid #fff;
+      margin-left: 4px;
+    }
+    #list.grid .name {
+      padding: 0.35rem 0.4rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 0.8rem;
+    }
+    #preview {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 1rem 1rem;
+      background: rgba(0, 0, 0, 0.82);
+    }
+    #preview[hidden] {
+      display: none;
+    }
+    #preview img,
+    #preview video {
+      max-width: 100%;
+      max-height: calc(100vh - 4rem);
+    }
+    .preview-bar {
+      position: absolute;
+      top: 0.5rem;
+      right: 0.5rem;
+      display: flex;
+      gap: 0.4rem;
+    }
     .snackbar {
       position: fixed;
       left: 50%;
@@ -186,6 +265,38 @@
       <button type="button" class="ghost" id="updir" hidden>上層</button>
       <span class="path" id="curpath">/</span>
       <span class="file-count hint" id="file-count" aria-live="polite"></span>
+      <button type="button" class="ghost ico" id="viewmode" aria-label="圖示" aria-pressed="false">
+        <svg
+          id="icon-grid"
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+        >
+          <path
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            d="M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z"
+          />
+        </svg>
+        <svg
+          id="icon-list"
+          width="18"
+          height="18"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+          hidden
+        >
+          <path
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            d="M4 6h16M4 12h16M4 18h16"
+          />
+        </svg>
+      </button>
       <button type="button" class="ghost ico" id="dldir" aria-label="下載">
         <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
           <path
@@ -212,11 +323,71 @@
       <span id="upload-status" role="status" aria-live="polite"></span>
     </div>
     <ul id="list"></ul>
+    <div id="preview" hidden>
+      <div class="preview-bar">
+        <button type="button" class="ghost" id="preview-dl">下載</button>
+        <button type="button" class="ghost" id="preview-close">關閉</button>
+      </div>
+      <img id="preview-img" alt="" hidden />
+      <video id="preview-vid" controls playsinline hidden></video>
+    </div>
     <div class="snackbar" id="snackbar" role="status" aria-live="polite"></div>
     <script>
       let cur = "";
       let snackbarTimer;
+      let previewPath = "";
+      let view = localStorage.getItem("view") === "grid" ? "grid" : "list";
       const $ = (id) => document.getElementById(id);
+      const DL_SVG =
+        '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>';
+
+      function kind(name) {
+        if (/\.(jpe?g|png|gif|webp|bmp|avif)$/i.test(name)) return "image";
+        if (/\.(mp4|webm|mov|m4v|mkv)$/i.test(name)) return "video";
+        return "";
+      }
+
+      function ph(type) {
+        const d = document.createElement("div");
+        d.className = "ph " + (type || "file");
+        return d;
+      }
+
+      function applyView() {
+        const grid = view === "grid";
+        $("list").classList.toggle("grid", grid);
+        $("icon-grid").hidden = grid;
+        $("icon-list").hidden = !grid;
+        $("viewmode").setAttribute("aria-label", grid ? "詳細資料" : "圖示");
+        $("viewmode").setAttribute("aria-pressed", String(grid));
+      }
+
+      function openPreview(filePath, k) {
+        previewPath = filePath;
+        const img = $("preview-img");
+        const vid = $("preview-vid");
+        const q = "/view?" + new URLSearchParams({ path: filePath });
+        img.hidden = k !== "image";
+        vid.hidden = k !== "video";
+        if (k === "image") {
+          vid.removeAttribute("src");
+          vid.load();
+          img.src = q;
+        } else {
+          img.removeAttribute("src");
+          vid.src = q;
+        }
+        $("preview").hidden = false;
+      }
+
+      function closePreview() {
+        $("preview").hidden = true;
+        $("preview-img").removeAttribute("src");
+        const vid = $("preview-vid");
+        vid.pause();
+        vid.removeAttribute("src");
+        vid.load();
+      }
 
       function showSnackbar(message) {
         const snackbar = $("snackbar");
@@ -273,6 +444,7 @@
       }
 
       async function load() {
+        applyView();
         $("curpath").textContent = "/" + cur;
         $("updir").hidden = !cur;
         const q = new URLSearchParams({ path: cur });
@@ -299,42 +471,85 @@
           ul.append(li);
           return;
         }
+        const grid = view === "grid";
+        const frag = document.createDocumentFragment();
         for (const it of data.items) {
           const li = document.createElement("li");
           const btn = document.createElement("button");
           btn.type = "button";
-          btn.textContent = it.name + (it.dir ? "/" : "");
+          const filePath = joinPath(cur, it.name);
+          const k = it.dir ? "dir" : kind(it.name);
           btn.onclick = () => {
             if (it.dir) {
-              cur = joinPath(cur, it.name);
+              cur = filePath;
               load();
+            } else if (grid && k) {
+              openPreview(filePath, k);
             } else {
-              downloadFile(joinPath(cur, it.name));
+              downloadFile(filePath);
             }
           };
-          li.append(btn);
-          if (it.dir) {
-            const a = document.createElement("a");
-            a.className = "sz";
-            a.setAttribute("aria-label", "下載");
-            a.innerHTML =
-              '<svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg>';
-            a.href =
-              "/dl?" + new URLSearchParams({ path: joinPath(cur, it.name) });
-            a.onclick = (event) => {
-              event.preventDefault();
-              downloadFile(joinPath(cur, it.name));
-            };
-            li.append(a);
+          if (grid) {
+            if (k === "image") {
+              const img = document.createElement("img");
+              img.className = "thumb";
+              img.loading = "lazy";
+              img.decoding = "async";
+              img.alt = "";
+              img.src = "/thumb?" + new URLSearchParams({ path: filePath });
+              img.onerror = () => {
+                img.onerror = null;
+                img.replaceWith(ph("image"));
+              };
+              btn.append(img);
+            } else {
+              btn.append(ph(k || "file"));
+            }
+            const name = document.createElement("span");
+            name.className = "name";
+            name.textContent = it.name + (it.dir ? "/" : "");
+            btn.append(name);
+            li.append(btn);
           } else {
-            const sz = document.createElement("span");
-            sz.className = "sz";
-            sz.textContent = fmtSize(it.size);
-            li.append(sz);
+            btn.textContent = it.name + (it.dir ? "/" : "");
+            li.append(btn);
+            if (it.dir) {
+              const a = document.createElement("a");
+              a.className = "sz";
+              a.setAttribute("aria-label", "下載");
+              a.innerHTML = DL_SVG;
+              a.href = "/dl?" + new URLSearchParams({ path: filePath });
+              a.onclick = (event) => {
+                event.preventDefault();
+                downloadFile(filePath);
+              };
+              li.append(a);
+            } else {
+              const sz = document.createElement("span");
+              sz.className = "sz";
+              sz.textContent = fmtSize(it.size);
+              li.append(sz);
+            }
           }
-          ul.append(li);
+          frag.append(li);
         }
+        ul.append(frag);
       }
+
+      $("viewmode").onclick = () => {
+        view = view === "grid" ? "list" : "grid";
+        localStorage.setItem("view", view);
+        load();
+      };
+
+      $("preview-close").onclick = closePreview;
+      $("preview-dl").onclick = () => downloadFile(previewPath);
+      $("preview").onclick = (e) => {
+        if (e.target === $("preview")) closePreview();
+      };
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") closePreview();
+      });
 
       $("dldir").onclick = () => downloadFile(cur);
 
