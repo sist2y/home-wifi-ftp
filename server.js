@@ -3,6 +3,7 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { exec, execSync } = require('child_process')
+const { crc32 } = require('zlib')
 
 const PORT = 8787
 const MIME = {
@@ -109,19 +110,6 @@ function openBrowser(url) {
   exec(cmd)
 }
 
-const CRC_TABLE = new Uint32Array(256)
-for (let i = 0; i < 256; i++) {
-  let c = i
-  for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-  CRC_TABLE[i] = c
-}
-
-function crc32(buf, crc = 0) {
-  crc ^= 0xffffffff
-  for (let i = 0; i < buf.length; i++) crc = CRC_TABLE[(crc ^ buf[i]) & 255] ^ (crc >>> 8)
-  return (crc ^ 0xffffffff) >>> 0
-}
-
 function zipLocal(name, crc, size, time, date, flags) {
   const h = Buffer.alloc(30)
   h.writeUInt32LE(0x04034b50, 0)
@@ -136,11 +124,21 @@ function zipLocal(name, crc, size, time, date, flags) {
   return Buffer.concat([h, name])
 }
 
+function u64(n) {
+  const b = Buffer.alloc(8)
+  b.writeBigUInt64LE(BigInt(n))
+  return b
+}
+
 function zipCentral(r) {
+  const zip64 = r.offset > 0xffffffff
+  const extra = zip64
+    ? Buffer.concat([Buffer.from([0x01, 0x00, 0x08, 0x00]), u64(r.offset)])
+    : Buffer.alloc(0)
   const h = Buffer.alloc(46)
   h.writeUInt32LE(0x02014b50, 0)
-  h.writeUInt16LE(20, 4)
-  h.writeUInt16LE(20, 6)
+  h.writeUInt16LE(zip64 ? 45 : 20, 4)
+  h.writeUInt16LE(zip64 ? 45 : 20, 6)
   h.writeUInt16LE(r.flags, 8)
   h.writeUInt16LE(r.time, 12)
   h.writeUInt16LE(r.date, 14)
@@ -148,9 +146,10 @@ function zipCentral(r) {
   h.writeUInt32LE(r.size, 20)
   h.writeUInt32LE(r.size, 24)
   h.writeUInt16LE(r.name.length, 28)
+  h.writeUInt16LE(extra.length, 30)
   h.writeUInt32LE(r.dir ? 0x10 : 0, 38)
-  h.writeUInt32LE(r.offset, 42)
-  return Buffer.concat([h, r.name])
+  h.writeUInt32LE(Math.min(r.offset, 0xffffffff), 42)
+  return Buffer.concat([h, r.name, extra])
 }
 
 function collectZip(dir, prefix, out) {
@@ -175,7 +174,7 @@ function dosTime(ms) {
   }
 }
 
-// ponytail: STORE zip, no zip64. Split if a file >4GB.
+// ponytail: STORE zip. zip64 EOCD if archive >4GB. Split if a file >4GB.
 async function zipDir(dir, res) {
   const base = path.basename(dir)
   const items = [{ rel: base, full: dir, dir: true }]
@@ -230,12 +229,29 @@ async function zipDir(dir, res) {
     res.write(cen)
     cdSize += cen.length
   }
+  if (cdStart > 0xffffffff || cdSize > 0xffffffff || records.length > 65535) {
+    const eocd64 = Buffer.alloc(56)
+    eocd64.writeUInt32LE(0x06064b50, 0)
+    eocd64.writeBigUInt64LE(44n, 4)
+    eocd64.writeUInt16LE(45, 12)
+    eocd64.writeUInt16LE(45, 14)
+    eocd64.writeBigUInt64LE(BigInt(records.length), 24)
+    eocd64.writeBigUInt64LE(BigInt(records.length), 32)
+    eocd64.writeBigUInt64LE(BigInt(cdSize), 40)
+    eocd64.writeBigUInt64LE(BigInt(cdStart), 48)
+    res.write(eocd64)
+    const loc = Buffer.alloc(20)
+    loc.writeUInt32LE(0x07064b50, 0)
+    loc.writeBigUInt64LE(BigInt(cdStart + cdSize), 8)
+    loc.writeUInt32LE(1, 16)
+    res.write(loc)
+  }
   const eocd = Buffer.alloc(22)
   eocd.writeUInt32LE(0x06054b50, 0)
-  eocd.writeUInt16LE(records.length, 8)
-  eocd.writeUInt16LE(records.length, 10)
-  eocd.writeUInt32LE(cdSize, 12)
-  eocd.writeUInt32LE(cdStart, 16)
+  eocd.writeUInt16LE(Math.min(records.length, 0xffff), 8)
+  eocd.writeUInt16LE(Math.min(records.length, 0xffff), 10)
+  eocd.writeUInt32LE(Math.min(cdSize, 0xffffffff), 12)
+  eocd.writeUInt32LE(Math.min(cdStart, 0xffffffff), 16)
   res.end(eocd)
 }
 

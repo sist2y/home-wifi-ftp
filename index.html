@@ -221,6 +221,34 @@
       display: flex;
       gap: 0.4rem;
     }
+    button.preview-nav {
+      position: absolute;
+      top: 50%;
+      min-width: 2.75rem;
+      padding: 0.35rem 0.6rem;
+      font-size: 1.5rem;
+      transform: translateY(-50%);
+    }
+    .preview-count {
+      position: absolute;
+      top: -0.65rem;
+      left: 50%;
+      min-width: 1.2rem;
+      padding: 0.15rem 0.25rem;
+      border: 1px solid #fff;
+      background: #1a1a1a;
+      color: #fff;
+      font-size: 0.7rem;
+      line-height: 1;
+      transform: translate(-50%, -100%);
+      pointer-events: none;
+    }
+    #preview-prev {
+      left: 0.75rem;
+    }
+    #preview-next {
+      right: 0.75rem;
+    }
     .snackbar {
       position: fixed;
       left: 50%;
@@ -265,7 +293,13 @@
       <button type="button" class="ghost" id="updir" hidden>上層</button>
       <span class="path" id="curpath">/</span>
       <span class="file-count hint" id="file-count" aria-live="polite"></span>
-      <button type="button" class="ghost ico" id="viewmode" aria-label="圖示" aria-pressed="false">
+      <button
+        type="button"
+        class="ghost ico"
+        id="viewmode"
+        aria-label="圖示"
+        aria-pressed="false"
+      >
         <svg
           id="icon-grid"
           width="18"
@@ -330,12 +364,36 @@
       </div>
       <img id="preview-img" alt="" hidden />
       <video id="preview-vid" controls playsinline hidden></video>
+      <button
+        type="button"
+        class="ghost preview-nav"
+        id="preview-prev"
+        aria-label="上一張"
+      >
+        <span
+          class="preview-count"
+          id="preview-before"
+          aria-hidden="true"
+        ></span
+        >&lt;
+      </button>
+      <button
+        type="button"
+        class="ghost preview-nav"
+        id="preview-next"
+        aria-label="下一張"
+      >
+        <span class="preview-count" id="preview-ahead" aria-hidden="true"></span
+        >&gt;
+      </button>
     </div>
     <div class="snackbar" id="snackbar" role="status" aria-live="polite"></div>
     <script>
       let cur = "";
       let snackbarTimer;
       let previewPath = "";
+      let previewImages = [];
+      let previewIndex = -1;
       let view = localStorage.getItem("view") === "grid" ? "grid" : "list";
       const $ = (id) => document.getElementById(id);
       const DL_SVG =
@@ -364,11 +422,30 @@
 
       function openPreview(filePath, k) {
         previewPath = filePath;
+        previewIndex = k === "image" ? previewImages.indexOf(filePath) : -1;
         const img = $("preview-img");
         const vid = $("preview-vid");
         const q = "/view?" + new URLSearchParams({ path: filePath });
         img.hidden = k !== "image";
         vid.hidden = k !== "video";
+        $("preview-prev").hidden = k !== "image";
+        $("preview-next").hidden = k !== "image";
+        $("preview-prev").disabled = previewIndex <= 0;
+        $("preview-next").disabled =
+          previewIndex < 0 || previewIndex >= previewImages.length - 1;
+        const before = Math.max(previewIndex, 0);
+        const ahead =
+          previewIndex < 0 ? 0 : previewImages.length - previewIndex - 1;
+        $("preview-before").textContent = before;
+        $("preview-ahead").textContent = ahead;
+        $("preview-prev").setAttribute(
+          "aria-label",
+          `上一張，前面有 ${before} 張相片`,
+        );
+        $("preview-next").setAttribute(
+          "aria-label",
+          `下一張，後面有 ${ahead} 張相片`,
+        );
         if (k === "image") {
           vid.removeAttribute("src");
           vid.load();
@@ -378,6 +455,12 @@
           vid.src = q;
         }
         $("preview").hidden = false;
+      }
+
+      function movePreview(offset) {
+        const nextIndex = previewIndex + offset;
+        if (nextIndex < 0 || nextIndex >= previewImages.length) return;
+        openPreview(previewImages[nextIndex], "image");
       }
 
       function closePreview() {
@@ -399,30 +482,11 @@
         }, 3000);
       }
 
-      async function downloadFile(filePath) {
-        try {
-          const response = await fetch(
-            "/dl?" + new URLSearchParams({ path: filePath }),
-          );
-          if (!response.ok) throw new Error("download failed");
-          const blob = await response.blob();
-          const disposition = response.headers.get("content-disposition") || "";
-          const encodedName = disposition.match(
-            /filename\*=UTF-8''([^;]+)/i,
-          )?.[1];
-          const filename = encodedName
-            ? decodeURIComponent(encodedName)
-            : filePath.split("/").pop() || "download";
-          const url = URL.createObjectURL(blob);
-          const link = document.createElement("a");
-          link.href = url;
-          link.download = filename;
-          link.click();
-          setTimeout(() => URL.revokeObjectURL(url), 1000);
-          showSnackbar("下載完成：" + filename);
-        } catch {
-          showSnackbar("下載失敗");
-        }
+      function downloadFile(filePath) {
+        const a = document.createElement("a");
+        a.href = "/dl?" + new URLSearchParams({ path: filePath });
+        a.download = "";
+        a.click();
       }
 
       function fmtSize(n) {
@@ -453,6 +517,7 @@
         const ul = $("list");
         ul.replaceChildren();
         if (!r.ok) {
+          previewImages = [];
           $("file-count").textContent = "";
           ul.append(
             Object.assign(document.createElement("li"), {
@@ -462,6 +527,9 @@
           );
           return;
         }
+        previewImages = data.items
+          .filter((item) => !item.dir && kind(item.name) === "image")
+          .map((item) => joinPath(cur, item.name));
         const fileCount = data.items.filter((item) => !item.dir).length;
         $("file-count").textContent = `${fileCount} 個檔案`;
         if (!data.items.length) {
@@ -519,10 +587,7 @@
               a.setAttribute("aria-label", "下載");
               a.innerHTML = DL_SVG;
               a.href = "/dl?" + new URLSearchParams({ path: filePath });
-              a.onclick = (event) => {
-                event.preventDefault();
-                downloadFile(filePath);
-              };
+              a.download = "";
               li.append(a);
             } else {
               const sz = document.createElement("span");
@@ -543,6 +608,8 @@
       };
 
       $("preview-close").onclick = closePreview;
+      $("preview-prev").onclick = () => movePreview(-1);
+      $("preview-next").onclick = () => movePreview(1);
       $("preview-dl").onclick = () => downloadFile(previewPath);
       $("preview").onclick = (e) => {
         if (e.target === $("preview")) closePreview();
