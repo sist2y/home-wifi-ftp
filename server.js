@@ -45,14 +45,17 @@ function resolveUnder(root, rel) {
   return out
 }
 
-function lanIp() {
-  for (const addrs of Object.values(os.networkInterfaces())) {
-    for (const a of addrs || []) {
-      const v4 = a.family === 'IPv4' || a.family === 4
-      if (v4 && !a.internal) return a.address
-    }
-  }
-  return '127.0.0.1'
+function lanIp(interfaces = os.networkInterfaces()) {
+  const candidates = Object.entries(interfaces).flatMap(([name, addrs]) =>
+    (addrs || [])
+      .filter((a) => (a.family === 'IPv4' || a.family === 4) && !a.internal)
+      .map((a) => ({ name, address: a.address })),
+  )
+  const wireless = candidates.find(({ name }) => /wi[\s-]?fi|wireless|wlan/i.test(name))
+  if (wireless) return wireless.address
+
+  const physical = candidates.find(({ name }) => !/vEthernet|WSL|Hyper-V|virtual/i.test(name))
+  return (physical || candidates[0])?.address || '127.0.0.1'
 }
 
 function ssid() {
@@ -110,18 +113,22 @@ function openBrowser(url) {
   exec(cmd)
 }
 
-function zipLocal(name, crc, size, time, date, flags) {
+function zipLocal(name, size, time, date, flags, zip64) {
+  const extra = zip64
+    ? Buffer.concat([Buffer.from([0x01, 0x00, 0x10, 0x00]), Buffer.alloc(16)])
+    : Buffer.alloc(0)
   const h = Buffer.alloc(30)
   h.writeUInt32LE(0x04034b50, 0)
-  h.writeUInt16LE(20, 4)
+  h.writeUInt16LE(zip64 ? 45 : 20, 4)
   h.writeUInt16LE(flags, 6)
   h.writeUInt16LE(time, 10)
   h.writeUInt16LE(date, 12)
-  h.writeUInt32LE(crc, 14)
-  h.writeUInt32LE(size, 18)
-  h.writeUInt32LE(size, 22)
+  h.writeUInt32LE(0, 14)
+  h.writeUInt32LE(zip64 ? 0xffffffff : 0, 18)
+  h.writeUInt32LE(zip64 ? 0xffffffff : 0, 22)
   h.writeUInt16LE(name.length, 26)
-  return Buffer.concat([h, name])
+  h.writeUInt16LE(extra.length, 28)
+  return Buffer.concat([h, name, extra])
 }
 
 function u64(n) {
@@ -131,10 +138,18 @@ function u64(n) {
 }
 
 function zipCentral(r) {
-  const zip64 = r.offset > 0xffffffff
-  const extra = zip64
-    ? Buffer.concat([Buffer.from([0x01, 0x00, 0x08, 0x00]), u64(r.offset)])
+  const zip64Size = r.size >= 0xffffffffn
+  const zip64Offset = r.offset > 0xffffffffn
+  const zip64Values = []
+  if (zip64Size) zip64Values.push(u64(r.size), u64(r.size))
+  if (zip64Offset) zip64Values.push(u64(r.offset))
+  const extra = zip64Values.length
+    ? Buffer.concat([
+        Buffer.from([0x01, 0x00, zip64Values.length * 8, 0x00]),
+        ...zip64Values,
+      ])
     : Buffer.alloc(0)
+  const zip64 = zip64Size || zip64Offset
   const h = Buffer.alloc(46)
   h.writeUInt32LE(0x02014b50, 0)
   h.writeUInt16LE(zip64 ? 45 : 20, 4)
@@ -143,93 +158,127 @@ function zipCentral(r) {
   h.writeUInt16LE(r.time, 12)
   h.writeUInt16LE(r.date, 14)
   h.writeUInt32LE(r.crc, 16)
-  h.writeUInt32LE(r.size, 20)
-  h.writeUInt32LE(r.size, 24)
+  h.writeUInt32LE(zip64Size ? 0xffffffff : Number(r.size), 20)
+  h.writeUInt32LE(zip64Size ? 0xffffffff : Number(r.size), 24)
   h.writeUInt16LE(r.name.length, 28)
   h.writeUInt16LE(extra.length, 30)
   h.writeUInt32LE(r.dir ? 0x10 : 0, 38)
-  h.writeUInt32LE(Math.min(r.offset, 0xffffffff), 42)
+  h.writeUInt32LE(zip64Offset ? 0xffffffff : Number(r.offset), 42)
   return Buffer.concat([h, r.name, extra])
 }
 
-function collectZip(dir, prefix, out) {
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+async function* collectZip(dir, prefix) {
+  for (const e of await fs.promises.readdir(dir, { withFileTypes: true })) {
     if (e.name.startsWith('.')) continue
+    if (e.isSymbolicLink()) continue
     const rel = prefix + '/' + e.name
     const full = path.join(dir, e.name)
     if (e.isDirectory()) {
-      out.push({ rel, full, dir: true })
-      collectZip(full, rel, out)
+      yield { rel, full, dir: true }
+      yield* collectZip(full, rel)
     } else if (e.isFile()) {
-      out.push({ rel, full, dir: false })
+      yield { rel, full, dir: false }
     }
   }
 }
 
 function dosTime(ms) {
   const d = new Date(ms)
+  const year = Math.max(1980, Math.min(d.getFullYear(), 2107))
   return {
     time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
-    date: ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    date: ((year - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
   }
 }
 
-// ponytail: STORE zip. zip64 EOCD if archive >4GB. Split if a file >4GB.
+function writeZipChunk(res, chunk) {
+  if (res.destroyed || res.writableEnded) {
+    return Promise.reject(new Error('download cancelled'))
+  }
+  if (res.write(chunk)) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      res.off('drain', onDrain)
+      res.off('error', onError)
+      res.off('close', onClose)
+    }
+    const onDrain = () => {
+      cleanup()
+      resolve()
+    }
+    const onError = (err) => {
+      cleanup()
+      reject(err)
+    }
+    const onClose = () => {
+      cleanup()
+      reject(new Error('download cancelled'))
+    }
+    res.once('drain', onDrain)
+    res.once('error', onError)
+    res.once('close', onClose)
+  })
+}
+
 async function zipDir(dir, res) {
   const base = path.basename(dir)
-  const items = [{ rel: base, full: dir, dir: true }]
-  collectZip(dir, base, items)
   const records = []
-  let offset = 0
-  for (const it of items) {
+  let offset = 0n
+  const items = (async function* () {
+    yield { rel: base, full: dir, dir: true }
+    yield* collectZip(dir, base)
+  })()
+  for await (const it of items) {
+    if (res.destroyed || res.writableEnded) throw new Error('download cancelled')
     const name = Buffer.from(it.dir ? it.rel + '/' : it.rel)
-    const { time, date } = dosTime(fs.statSync(it.full).mtimeMs)
+    const st = await fs.promises.stat(it.full, { bigint: true })
+    const { time, date } = dosTime(Number(st.mtimeMs))
     if (it.dir) {
-      const loc = zipLocal(name, 0, 0, time, date, 0x800)
-      res.write(loc)
-      records.push({ name, crc: 0, size: 0, time, date, offset, flags: 0x800, dir: true })
-      offset += loc.length
+      const loc = zipLocal(name, 0n, time, date, 0x800, false)
+      await writeZipChunk(res, loc)
+      records.push({ name, crc: 0, size: 0n, time, date, offset, flags: 0x800, dir: true })
+      offset += BigInt(loc.length)
       continue
     }
-    const loc = zipLocal(name, 0, 0, time, date, 0x808)
-    res.write(loc)
+    const zip64 = st.size >= 0xffffffffn
+    const loc = zipLocal(name, st.size, time, date, 0x808, zip64)
+    await writeZipChunk(res, loc)
     let crc = 0
-    let size = 0
-    await new Promise((resolve, reject) => {
-      const rs = fs.createReadStream(it.full)
-      const onDrain = () => rs.resume()
-      res.on('drain', onDrain)
-      rs.on('data', (c) => {
-        crc = crc32(c, crc)
-        size += c.length
-        if (!res.write(c)) rs.pause()
-      })
-      rs.on('end', () => {
-        res.off('drain', onDrain)
-        resolve()
-      })
-      rs.on('error', (e) => {
-        res.off('drain', onDrain)
-        reject(e)
-      })
-    })
-    const desc = Buffer.alloc(16)
+    let size = 0n
+    const rs = fs.createReadStream(it.full)
+    const stopOnClose = () => rs.destroy(new Error('download cancelled'))
+    res.once('close', stopOnClose)
+    try {
+      for await (const chunk of rs) {
+        crc = crc32(chunk, crc)
+        size += BigInt(chunk.length)
+        await writeZipChunk(res, chunk)
+      }
+    } finally {
+      res.off('close', stopOnClose)
+    }
+    const desc = Buffer.alloc(zip64 ? 24 : 16)
     desc.writeUInt32LE(0x08074b50, 0)
     desc.writeUInt32LE(crc, 4)
-    desc.writeUInt32LE(size, 8)
-    desc.writeUInt32LE(size, 12)
-    res.write(desc)
+    if (zip64) {
+      desc.writeBigUInt64LE(size, 8)
+      desc.writeBigUInt64LE(size, 16)
+    } else {
+      desc.writeUInt32LE(Number(size), 8)
+      desc.writeUInt32LE(Number(size), 12)
+    }
+    await writeZipChunk(res, desc)
     records.push({ name, crc, size, time, date, offset, flags: 0x808, dir: false })
-    offset += loc.length + size + 16
+    offset += BigInt(loc.length) + size + BigInt(desc.length)
   }
   const cdStart = offset
-  let cdSize = 0
+  let cdSize = 0n
   for (const r of records) {
     const cen = zipCentral(r)
-    res.write(cen)
-    cdSize += cen.length
+    await writeZipChunk(res, cen)
+    cdSize += BigInt(cen.length)
   }
-  if (cdStart > 0xffffffff || cdSize > 0xffffffff || records.length > 65535) {
+  if (cdStart > 0xffffffffn || cdSize > 0xffffffffn || records.length > 65535) {
     const eocd64 = Buffer.alloc(56)
     eocd64.writeUInt32LE(0x06064b50, 0)
     eocd64.writeBigUInt64LE(44n, 4)
@@ -237,21 +286,21 @@ async function zipDir(dir, res) {
     eocd64.writeUInt16LE(45, 14)
     eocd64.writeBigUInt64LE(BigInt(records.length), 24)
     eocd64.writeBigUInt64LE(BigInt(records.length), 32)
-    eocd64.writeBigUInt64LE(BigInt(cdSize), 40)
-    eocd64.writeBigUInt64LE(BigInt(cdStart), 48)
-    res.write(eocd64)
+    eocd64.writeBigUInt64LE(cdSize, 40)
+    eocd64.writeBigUInt64LE(cdStart, 48)
+    await writeZipChunk(res, eocd64)
     const loc = Buffer.alloc(20)
     loc.writeUInt32LE(0x07064b50, 0)
-    loc.writeBigUInt64LE(BigInt(cdStart + cdSize), 8)
+    loc.writeBigUInt64LE(cdStart + cdSize, 8)
     loc.writeUInt32LE(1, 16)
-    res.write(loc)
+    await writeZipChunk(res, loc)
   }
   const eocd = Buffer.alloc(22)
   eocd.writeUInt32LE(0x06054b50, 0)
   eocd.writeUInt16LE(Math.min(records.length, 0xffff), 8)
   eocd.writeUInt16LE(Math.min(records.length, 0xffff), 10)
-  eocd.writeUInt32LE(Math.min(cdSize, 0xffffffff), 12)
-  eocd.writeUInt32LE(Math.min(cdStart, 0xffffffff), 16)
+  eocd.writeUInt32LE(Number(cdSize > 0xffffffffn ? 0xffffffffn : cdSize), 12)
+  eocd.writeUInt32LE(Number(cdStart > 0xffffffffn ? 0xffffffffn : cdStart), 16)
   res.end(eocd)
 }
 
@@ -367,7 +416,7 @@ function imageThumb(file) {
   }
 }
 
-function pipeFile(req, res, file, type) {
+function pipeFile(req, res, file, type, headers = {}) {
   const size = fs.statSync(file).size
   const m = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '')
   if (m) {
@@ -383,6 +432,7 @@ function pipeFile(req, res, file, type) {
       'content-length': end - start + 1,
       'content-range': `bytes ${start}-${end}/${size}`,
       'accept-ranges': 'bytes',
+      ...headers,
     })
     fs.createReadStream(file, { start, end }).pipe(res)
     return
@@ -391,6 +441,7 @@ function pipeFile(req, res, file, type) {
     'content-type': type,
     'content-length': size,
     'accept-ranges': 'bytes',
+    ...headers,
   })
   fs.createReadStream(file).pipe(res)
 }
@@ -484,18 +535,16 @@ function makeServer(root) {
             'content-type': 'application/zip',
             'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
           })
-          zipDir(p, res).catch(() => {
+          zipDir(p, res).catch((err) => {
+            if (!res.destroyed) console.error('[download] ZIP creation failed:', err)
             if (!res.writableEnded) res.destroy()
           })
           return
         }
         const name = path.basename(p)
-        res.writeHead(200, {
-          'content-type': 'application/octet-stream',
-          'content-length': st.size,
+        pipeFile(req, res, p, 'application/octet-stream', {
           'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
         })
-        fs.createReadStream(p).pipe(res)
         return
       }
       if (req.method === 'POST' && u.pathname === '/up') {
@@ -546,6 +595,6 @@ function main() {
   })
 }
 
-module.exports = { resolveUnder, makeServer }
+module.exports = { resolveUnder, makeServer, lanIp }
 
 if (require.main === module) main()

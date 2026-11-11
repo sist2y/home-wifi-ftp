@@ -3,7 +3,7 @@ const http = require('http')
 const os = require('os')
 const path = require('path')
 const assert = require('assert/strict')
-const { resolveUnder, makeServer } = require('./server')
+const { resolveUnder, makeServer, lanIp } = require('./server')
 
 const ok = ['', 'a.txt', 'sub/file']
 const bad = ['../x', '..\\x', '/etc/passwd', 'C:\\Windows', 'a/../../b', 'foo\0bar']
@@ -136,6 +136,22 @@ async function main() {
     }
     console.log('[test] path validation passed')
 
+    assert.equal(
+      lanIp({
+        'vEthernet (WSL)': [{ family: 'IPv4', internal: false, address: '172.30.0.1' }],
+        'Wireless LAN adapter Wi-Fi': [{ family: 'IPv4', internal: false, address: '192.168.1.23' }],
+      }),
+      '192.168.1.23',
+    )
+    assert.equal(
+      lanIp({
+        'vEthernet (WSL)': [{ family: 'IPv4', internal: false, address: '172.30.0.1' }],
+        Ethernet: [{ family: 'IPv4', internal: false, address: '192.168.1.24' }],
+      }),
+      '192.168.1.24',
+    )
+    console.log('[test] LAN IP selection passed')
+
     server = makeServer(root)
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const port = server.address().port
@@ -144,6 +160,16 @@ async function main() {
     assert.equal(download.status, 200)
     assert.deepEqual(download.body, testFile)
     assert.match(download.headers['content-disposition'], /test\.txt/)
+    const rangedDownload = await request(port, 'GET', '/dl?path=test.txt', null, {
+      range: 'bytes=8-15',
+    })
+    assert.equal(rangedDownload.status, 206)
+    assert.equal(rangedDownload.headers['accept-ranges'], 'bytes')
+    assert.equal(
+      rangedDownload.headers['content-range'],
+      `bytes 8-15/${testFile.length}`,
+    )
+    assert.deepEqual(rangedDownload.body, testFile.subarray(8, 16))
     console.log('[test] file download passed')
 
     const relativeTestDir = path.basename(testDir)
@@ -152,6 +178,7 @@ async function main() {
     assert.equal(folderDownload.headers['content-type'], 'application/zip')
     assert.match(folderDownload.headers['content-disposition'], new RegExp(`${relativeTestDir}\\.zip`))
     assert.deepEqual(readZipEntry(folderDownload.body, `${relativeTestDir}/sub/a.txt`), Buffer.from('hello'))
+    assert.throws(() => readZipEntry(folderDownload.body, `${relativeTestDir}/escape/secret.txt`))
 
     const zipDownload = await request(port, 'GET', `/dl?path=${relativeTestDir}/sub`)
     assert.equal(zipDownload.status, 200)

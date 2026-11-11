@@ -8,6 +8,7 @@ node server.js D:\想share嘅資料夾
 ```
 
 預設 share `shared/`。開咗會彈本機瀏覽器，畫面有 Wi-Fi 名同網址（`http://IP:8787`）。
+網址會優先使用 Wi-Fi 網卡 IPv4，避免選到 WSL 等虛擬網卡。
 
 ## 防火牆（Windows，要管理員）
 
@@ -33,7 +34,8 @@ netsh advfirewall firewall delete rule name="home-wifi-ftp"
 - 有啲 router 開咗 AP isolation，同一 Wi-Fi 都互唔見。
 - Wi-Fi 名只係確認大家同一網絡。真正用來連嘅係 IP 網址。
 - 「上載」：把而家呢部機嘅檔案丟入 host 個資料夾。Host 自己用 Explorer 拖入 `shared/` 都得。
-- 撳檔名即下載。瀏覽器會存去 Downloads，唔可以指定本機資料夾。
+- 撳檔名即下載。瀏覽器會存去 Downloads，唔可以指定本機資料夾。大檔案會直接串流；下載資料夾會即時建立並串流 ZIP，唔會先將成個檔案或 ZIP 載入記憶體。ZIP 支援超過 4 GB 嘅檔案。
+- 下載資料夾時頁面會提示 ZIP 正在準備；傳送進度同完成狀態請睇瀏覽器下載列。下載單一大檔案時，`/dl` 支援 HTTP byte ranges，方便支援續傳嘅下載工具。
 - 對方開條網址見到嘅就係同一個畫面，唔使 `client.js`。
 
 ## 限制

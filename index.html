@@ -482,7 +482,10 @@
         }, 3000);
       }
 
-      function downloadFile(filePath) {
+      function downloadFile(filePath, isDirectory = false) {
+        showSnackbar(
+          isDirectory ? "正在準備資料夾 ZIP…" : "下載要求已送出，請查看瀏覽器下載列",
+        );
         const a = document.createElement("a");
         a.href = "/dl?" + new URLSearchParams({ path: filePath });
         a.download = "";
@@ -588,6 +591,10 @@
               a.innerHTML = DL_SVG;
               a.href = "/dl?" + new URLSearchParams({ path: filePath });
               a.download = "";
+              a.onclick = (event) => {
+                event.preventDefault();
+                downloadFile(filePath, true);
+              };
               li.append(a);
             } else {
               const sz = document.createElement("span");
@@ -618,7 +625,7 @@
         if (e.key === "Escape") closePreview();
       });
 
-      $("dldir").onclick = () => downloadFile(cur);
+      $("dldir").onclick = () => downloadFile(cur, true);
 
       $("updir").onclick = () => {
         if (!cur) return;
