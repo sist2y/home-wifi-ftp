@@ -2,6 +2,8 @@ const fs = require('fs')
 const http = require('http')
 const os = require('os')
 const path = require('path')
+const { createHash } = require('crypto')
+const { crc32 } = require('zlib')
 const assert = require('assert/strict')
 const { resolveUnder, makeServer, lanIp } = require('./server')
 
@@ -22,6 +24,122 @@ function request(port, method, route, body, headers) {
     req.on('error', reject)
     if (body) req.write(body)
     req.end()
+  })
+}
+
+function requestDigest(port, route) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ hostname: '127.0.0.1', port, path: route }, (res) => {
+      const hash = createHash('sha256')
+      let size = 0
+      res.on('data', (chunk) => {
+        hash.update(chunk)
+        size += chunk.length
+      })
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        size,
+        hash: hash.digest('hex'),
+      }))
+      res.on('error', reject)
+    })
+    req.on('error', reject)
+  })
+}
+
+function requestLargeFolderZip(port, folderName, fileName, fileSize) {
+  const folderEntry = Buffer.from(`${folderName}/`)
+  const fileEntry = Buffer.from(`${folderName}/${fileName}`)
+  const fileHeaderOffset = 30 + folderEntry.length
+  const fileDataOffset = fileHeaderOffset + 30 + fileEntry.length
+  const descriptorOffset = fileDataOffset + fileSize
+  const centralOffset = descriptorOffset + 16
+  const centralSize = 46 + folderEntry.length + 46 + fileEntry.length
+  const expectedSize = centralOffset + centralSize + 22
+  const prefix = Buffer.alloc(fileDataOffset)
+  let descriptor = Buffer.alloc(0)
+  let tail = Buffer.alloc(0)
+  let size = 0
+  let fileCrc = 0
+
+  const expectedChunk = Buffer.alloc(1024 * 1024)
+  let expectedCrc = 0
+  for (let remaining = fileSize; remaining > 0; remaining -= expectedChunk.length) {
+    expectedCrc = crc32(expectedChunk, expectedCrc)
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = http.get(
+      { hostname: '127.0.0.1', port, path: `/dl?path=${encodeURIComponent(folderName)}` },
+      (res) => {
+        res.on('data', (chunk) => {
+          const chunkStart = size
+          const chunkEnd = size + chunk.length
+          const prefixLength = Math.min(chunk.length, prefix.length - chunkStart)
+          if (prefixLength > 0) {
+            chunk.copy(prefix, chunkStart, 0, prefixLength)
+          }
+          const descriptorStart = Math.max(descriptorOffset, chunkStart)
+          const descriptorEnd = Math.min(descriptorOffset + 16, chunkEnd)
+          if (descriptorEnd > descriptorStart) {
+            descriptor = Buffer.concat([
+              descriptor,
+              chunk.subarray(descriptorStart - chunkStart, descriptorEnd - chunkStart),
+            ])
+          }
+          const dataStart = Math.max(fileDataOffset, chunkStart)
+          const dataEnd = Math.min(descriptorOffset, chunkEnd)
+          if (dataEnd > dataStart) {
+            fileCrc = crc32(
+              chunk.subarray(dataStart - chunkStart, dataEnd - chunkStart),
+              fileCrc,
+            )
+          }
+          size = chunkEnd
+          tail = Buffer.concat([tail, chunk]).subarray(-22)
+        })
+        res.on('end', () => {
+          try {
+            assert.equal(res.statusCode, 200)
+            assert.equal(res.headers['content-type'], 'application/zip')
+            assert.equal(size, expectedSize, 'ZIP download was truncated or oversized')
+            assert.equal(prefix.readUInt32LE(0), 0x04034b50, 'folder entry missing')
+            assert.equal(
+              prefix.toString('utf8', 30, 30 + folderEntry.length),
+              folderEntry.toString(),
+            )
+            assert.equal(prefix.readUInt32LE(fileHeaderOffset), 0x04034b50, 'file entry missing')
+            assert.equal(prefix.readUInt16LE(fileHeaderOffset + 6), 0x0808)
+            assert.equal(
+              prefix.toString(
+                'utf8',
+                fileHeaderOffset + 30,
+                fileHeaderOffset + 30 + fileEntry.length,
+              ),
+              fileEntry.toString(),
+            )
+            assert.equal(fileCrc, expectedCrc, 'large file content checksum mismatch')
+            assert.equal(descriptor.length, 16, 'ZIP data descriptor missing')
+            assert.equal(descriptor.readUInt32LE(0), 0x08074b50)
+            assert.equal(descriptor.readUInt32LE(4), expectedCrc)
+            assert.equal(descriptor.readUInt32LE(8), fileSize)
+            assert.equal(descriptor.readUInt32LE(12), fileSize)
+            assert.equal(tail.readUInt32LE(0), 0x06054b50, 'ZIP end record missing')
+            assert.equal(tail.readUInt16LE(8), 2)
+            assert.equal(tail.readUInt16LE(10), 2)
+            assert.equal(tail.readUInt32LE(12), centralSize)
+            assert.equal(tail.readUInt32LE(16), centralOffset)
+            resolve()
+          } catch (error) {
+            reject(error)
+          }
+        })
+        res.on('error', reject)
+        res.on('aborted', () => reject(new Error('large folder ZIP response aborted')))
+      },
+    )
+    req.on('error', reject)
   })
 }
 
@@ -171,6 +289,48 @@ async function main() {
     )
     assert.deepEqual(rangedDownload.body, testFile.subarray(8, 16))
     console.log('[test] file download passed')
+
+    const largeFilePath = path.join(root, 'large-download.bin')
+    try {
+      const size = 64 * 1024 * 1024
+      const chunk = Buffer.alloc(1024 * 1024, 0x5a)
+      const expectedHash = createHash('sha256')
+      const fd = fs.openSync(largeFilePath, 'w')
+      try {
+        for (let written = 0; written < size; written += chunk.length) {
+          fs.writeSync(fd, chunk)
+          expectedHash.update(chunk)
+        }
+      } finally {
+        fs.closeSync(fd)
+      }
+
+      const largeDownload = await requestDigest(port, '/dl?path=large-download.bin')
+      assert.equal(largeDownload.status, 200)
+      assert.equal(Number(largeDownload.headers['content-length']), size)
+      assert.equal(largeDownload.size, size)
+      assert.equal(largeDownload.hash, expectedHash.digest('hex'))
+      console.log('[test] large file download passed (64 MiB)')
+    } finally {
+      fs.rmSync(largeFilePath, { force: true })
+    }
+
+    const largeFolderPath = path.join(root, 'large-folder-download')
+    try {
+      fs.mkdirSync(largeFolderPath)
+      const largeFolderFilePath = path.join(largeFolderPath, 'large.bin')
+      const fd = fs.openSync(largeFolderFilePath, 'w')
+      try {
+        fs.ftruncateSync(fd, 1024 * 1024 * 1024)
+      } finally {
+        fs.closeSync(fd)
+      }
+
+      await requestLargeFolderZip(port, 'large-folder-download', 'large.bin', 1024 * 1024 * 1024)
+      console.log('[test] 1 GiB folder download passed')
+    } finally {
+      fs.rmSync(largeFolderPath, { recursive: true, force: true })
+    }
 
     const relativeTestDir = path.basename(testDir)
     const folderDownload = await request(port, 'GET', `/dl?path=${relativeTestDir}`)
